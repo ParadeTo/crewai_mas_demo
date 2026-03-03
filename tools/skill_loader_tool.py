@@ -25,30 +25,95 @@ import sys
 from pathlib import Path
 
 import yaml
+from crewai import Agent, Crew, Process, Task
+from crewai.mcp import MCPServerHTTP
+from crewai.mcp.filters import create_static_tool_filter
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
-# 将 crewai_mas_demo/ 加入 sys.path，使 llm 包可被 import
-# 将 m2l16/ 加入 sys.path，使 crews.skill_crew 可被 import
+# 将项目根（crewai_mas_demo/）加入 sys.path，使 llm 包可被 import
 _TOOLS_DIR = Path(__file__).parent
-_M2L16_ROOT = _TOOLS_DIR.parent
-_PROJECT_ROOT = _M2L16_ROOT.parent
-for _p in [str(_M2L16_ROOT), str(_PROJECT_ROOT)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_PROJECT_ROOT = _TOOLS_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-from crews.skill_crew import build_skill_crew  # noqa: E402
+from llm import AliyunLLM  # noqa: E402
 
 # ── 路径常量 ────────────────────────────────────────────────────────────────
 # SKILLS_DIR：共享 skills 目录（crewai_mas_demo/skills/），所有课程共用
-# 💡 核心点：__file__ 是 m2l16/tools/skill_loader_tool.py，上三级即 crewai_mas_demo/
-SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
+# 💡 核心点：__file__ 是 tools/skill_loader_tool.py，上一层是 tools/，上两层即 crewai_mas_demo/
+SKILLS_DIR = _PROJECT_ROOT / "skills"
 
-# 沙盒内的 skills 挂载路径（与 docker-compose.yaml 的 volumes 对应）
+# 沙盒内的 skills 挂载路径（与 sandbox-docker-compose.yaml 的 volumes 对应）
 SANDBOX_SKILLS_MOUNT = "/mnt/skills"
+
+# ── AIO-Sandbox MCP 配置（Sub-Crew 使用） ─────────────────────────────────────
+
+# 需要提前通过 sandbox-docker-compose.yaml 启动 AIO-Sandbox，端口 8022 对应 8080
+SANDBOX_MCP_URL = "http://localhost:8022/mcp"
+
+# 白名单过滤：只开放 4 个沙盒工具，排除 browser_* 系列
+SANDBOX_TOOL_FILTER = create_static_tool_filter(
+    allowed_tool_names=[
+        "sandbox_execute_bash",
+        "sandbox_execute_code",
+        "sandbox_file_operations",
+        "sandbox_str_replace_editor",
+    ]
+)
+
+
+def build_skill_crew(skill_name: str, skill_instructions: str) -> Crew:
+    """
+    Sub-Crew 工厂：为指定 Skill 构建一个在 AIO-Sandbox 中执行的 Crew。
+    """
+    sandbox_mcp = MCPServerHTTP(
+        url=SANDBOX_MCP_URL,
+        tool_filter=SANDBOX_TOOL_FILTER,
+    )
+
+    skill_llm = AliyunLLM(model="qwen3-max", region="cn", temperature=0.3)
+
+    skill_agent = Agent(
+        role=f"{skill_name.upper()} Skill 执行专家",
+        goal=f"严格按照 {skill_name} Skill 的操作规范，在 AIO-Sandbox 中完成任务",
+        backstory=(
+            f"你是一位专精于 {skill_name} 文件处理的 AI 专家。\n"
+            f"你掌握以下操作规范，请严格遵循：\n\n"
+            f"{skill_instructions}"
+        ),
+        llm=skill_llm,
+        mcps=[sandbox_mcp],
+        verbose=True,
+        max_iter=10,
+    )
+
+    skill_task = Task(
+        description=(
+            "根据以下任务要求，使用你掌握的 Skill 操作规范完成任务。\n\n"
+            "任务要求：\n{task_context}\n\n"
+            "执行要求：\n"
+            "1. 所有的操作必须在沙盒中执行，不得操作本地文件系统，当前已挂载在沙盒的本地目录为./workspace/data:/workspace/data:ro和./workspace/output:/workspace/output:rw\n"
+            "2. 如果需要读取本地文件，则需要本地文件在./workspace/data/目录下，且提供的本地路径会在对应沙盒绝对路径的/workspace/data/目录下。如果文件不在./workspace/data/目录下，则需要提示用户本地文件路径错误，无法执行任务。\n"
+            "3. 任务预期输出的文件，必须写在沙盒绝对路径的/workspace/output/目录下，且提供的本地路径会在对应的./workspace/output/目录下\n"
+            "4. 如遇依赖缺失，先在沙盒中安装再继续"
+        ),
+        expected_output=(
+            "一份结构化的任务执行结果，按照任务要求中的json schema输出。"
+        ),
+        agent=skill_agent,
+    )
+
+    return Crew(
+        agents=[skill_agent],
+        tasks=[skill_task],
+        process=Process.sequential,
+        verbose=True,
+    )
 
 
 # ── 输入 Schema ─────────────────────────────────────────────────────────────
+
 
 class SkillLoaderInput(BaseModel):
     skill_name: str = Field(
@@ -56,12 +121,14 @@ class SkillLoaderInput(BaseModel):
     )
     task_context: str = Field(
         description=(
-            "调用此 Skill 要完成的任务的完整描述。"
-            "【必须包含以下四项，缺一不可】\n"
-            "1. 输入文件的沙盒绝对路径（如 /workspace/data/report.pdf）\n"
-            "2. 期望的输出内容结构（如：包含标题、摘要、关键数据三个章节）\n"
-            "3. 输出文件的沙盒绝对路径（如 /workspace/output/summary.docx）\n"
-            "4. 特殊格式要求（如无则填写'无'）\n"
+            "如果是参考型skill，此项为空。\n"
+            "如果是任务型skill，此项为调用此 Skill 要完成的子任务的完整描述。包括：\n"
+            "1. 子任务的概要描述\n"
+            "2. 任务完成目标的预期输出，这里必须是结构化格式，通过一个json schema进行定义。各个字段的描述必须有明确的描述和示例.有两个必选字段errcode和errmsg，errcode为0表示成功，非0表示失败，errmsg为错误信息，成功时固定返回\"success\"，失败时必须包括错误信息、错误原因和建议的下一步解决方案。\n"
+            "3. （可选）如果有完成任务的参考步骤和方法，可以提供对应描述\n"
+            "4. （可选）如果完成任务有输入文件，则需要提供输入文件的沙盒绝对路径（如 /workspace/data/report.pdf），如果该文件是本地文件，沙盒路径是由本地文件系统挂载的，挂载配置: ./workspace/data:/workspace/data:ro，因此本地的文件路径需要转换为沙盒路径。如果该文件是沙盒内文件，则直接提供文件路径即可。\n"
+            "5. （可选）如果完成任务有输出文件，则需要在json schema中定义输出文件的格式，并提供输出文件的本地路径,因为挂载配置:./workspace/output:/workspace/output:rw，所以要保证沙盒路径在/workspace/output/目录下, 且提供的本地路径会在对应的./workspace/output/目录下\n"
+            "4. （可选）如果有其它特殊要求，可以在此处提供\n"
             "提供信息越完整，Skill 执行越精准。"
         )
     )
@@ -69,9 +136,10 @@ class SkillLoaderInput(BaseModel):
 
 # ── 核心工具 ─────────────────────────────────────────────────────────────────
 
+
 class SkillLoaderTool(BaseTool):
     name: str = "skill_loader"
-    description: str = ""           # 在 __init__ 中动态构建
+    description: str = ""  # 在 __init__ 中动态构建
     args_schema: type[BaseModel] = SkillLoaderInput
 
     # Pydantic 会把普通 dict 属性当作模型字段，用 PrivateAttr 或 ClassVar 绕开
@@ -125,7 +193,7 @@ class SkillLoaderTool(BaseTool):
         # 💡 核心点：约束已在 SkillLoaderInput.task_context 的 Field description 中定义，
         #    这里只展示 Skill 能力清单，保持 description 简洁
         self.description = (
-            "当任务涉及文档处理（PDF读取、Word生成、Excel分析等）时，调用此工具。\n"
+            "当需要完成的任务涉及以下XML 列表中的技能时，调用此工具。\n"
             "根据下方 XML 列表选择正确的 skill_name，并在 task_context 中提供完整任务信息。\n\n"
             + "\n".join(xml_parts)
         )
@@ -157,14 +225,22 @@ class SkillLoaderTool(BaseTool):
         # 剥离 YAML frontmatter（--- ... ---）
         stripped = re.sub(r"^---\n.*?\n---\n?", "", content, flags=re.DOTALL)
 
-        # 拼接沙盒路径替换指令，消灭 LLM 路径幻觉
+        # 拼接沙盒路径替换指令，消灭 LLM 路径幻觉（工具名与参数与 AIO-Sandbox MCP 一致）
+        _base = f"{SANDBOX_SKILLS_MOUNT}/{skill_name}"
         sandbox_directive = (
             f"\n\n<sandbox_execution_directive>\n"
-            f"【强制约束】所有脚本和文件操作必须在 AIO-Sandbox 中执行，禁止直接操作本地文件系统。\n"
-            f"此 Skill 资源已挂载至沙盒绝对路径：{SANDBOX_SKILLS_MOUNT}/{skill_name}/\n"
-            f"- scripts/xxx.py → {SANDBOX_SKILLS_MOUNT}/{skill_name}/scripts/xxx.py\n"
-            f"- 执行命令示例：sandbox_execute_bash('python {SANDBOX_SKILLS_MOUNT}/{skill_name}/scripts/xxx.py ...')\n"
-            f"- 遇到依赖缺失时，先 sandbox_execute_bash('pip install xxx') 再重试。\n"
+            f"IMPORTANT:【强制约束】所有脚本和文件操作必须在 AIO-Sandbox 中执行，禁止直接操作本地文件系统。\n"
+            f"此 Skill 资源已挂载至沙盒绝对路径：{_base}/\n\n"
+            f"可用沙盒工具及正确用法：\n"
+            f"1. sandbox_execute_bash：执行 Shell 命令。参数：cmd（必填，字符串）、cwd（可选，工作目录绝对路径）、timeout（可选，秒）。\n"
+            f"   - 运行脚本示例：如需运行脚本scripts/xxx.py，则调用sandbox_execute_bash且参数为cmd=\"python {_base}/scripts/xxx.py 参数\"，如需可设 cwd=\"{_base}\"。\n"
+            f"   - 安装依赖：cmd=\"pip install 包名\"，再重试任务。\n"
+            f"2. sandbox_file_operations：统一文件操作。参数：action（必填，'read'|'write'|'list'|'find'|'replace'|'search'）、path（必填，文件或目录绝对路径）、其余见工具说明。\n"
+            f"   - 读取单个文件：action=\"read\", path=\"文件绝对路径\"（示例：如需要获取reference/xxx.md，则调用工具sandbox_file_operations且参数为action=\"read\", path=\"{_base}/reference/xxx.md\"）。\n"
+            f"   - 列出目录：action=\"list\", path=\"目录绝对路径\"（如 path=\"{_base}/reference\"），可选 recursive=true。\n"
+            f"   - 按模式查找文件：action=\"find\", path=\"目录\", pattern=\"*.md\"。\n"
+            f"3. sandbox_str_replace_editor：编辑文件。参数：command（'view'|'create'|'str_replace'|'insert'）、path（文件路径）等。\n"
+            f"4. sandbox_execute_code：执行代码片段。参数：code（必填）、language（'python'|'javascript'）、timeout（可选）。\n"
             f"</sandbox_execution_directive>"
         )
 
@@ -189,10 +265,12 @@ class SkillLoaderTool(BaseTool):
             skill_name=skill_name,
             skill_instructions=instructions,
         )
-        result = await crew.akickoff(inputs={
-            "task_context": task_context,
-            "skill_name": skill_name,
-        })
+        result = await crew.akickoff(
+            inputs={
+                "task_context": task_context,
+                "skill_name": skill_name,
+            }
+        )
         return str(result)
 
     # ── 异步路径（FastAPI / akickoff 调用链）────────────────────────────────
@@ -223,3 +301,4 @@ class SkillLoaderTool(BaseTool):
                 self._execute_skill_async(skill_name, task_context),
             )
             return future.result()
+

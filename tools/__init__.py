@@ -16,9 +16,9 @@ from tools.fixed_directory_read_tool import FixedDirectoryReadTool
 from tools.intermediate_tool import IntermediateTool
 
 __all__ = [
-    'AddImageToolLocal',
-    'BaiduSearchTool',
-    'FixedDirectoryReadTool',
-    'IntermediateTool',
+    "AddImageToolLocal",
+    "BaiduSearchTool",
+    "FixedDirectoryReadTool",
+    "IntermediateTool",
 ]
 

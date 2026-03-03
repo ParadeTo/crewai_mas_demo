@@ -7,10 +7,11 @@ services:
     volumes:
       # 💡 核心点：skills 挂载为只读，防止 Agent 篡改 Skill 文件
       # skills 是 crewai_mas_demo 级共享资源，所有课复用
-      - ../skills:/mnt/skills:ro
-      # output 可读写，Agent 在此生成 docx 文件后可直接在宿主机取到
-      - ./output:/workspace/output:rw
-      # data 只读，提供输入 PDF
-      - ./data:/workspace/data:ro
+      - ./skills:/mnt/skills:ro
+      # output 可读写，统一挂载到仓库外层 workspace/output
+      - ./workspace/output:/workspace/output:rw
+      # data 只读，统一挂载到仓库外层 workspace/data
+      - ./workspace/data:/workspace/data:ro
     security_opt:
       - seccomp:unconfined
+
