@@ -1,13 +1,1 @@
-[
-  {
-    "id": "b76f58d8-d448-4b26-ad4a-b28f6328c143",
-    "from": "manager",
-    "to": "pm",
-    "type": "task_assign",
-    "subject": "产品文档设计任务",
-    "content": "请基于以下需求完成产品文档设计：\n\n✅ 输入需求：/mnt/shared/needs/requirements.md\n✅ 输出交付物：/mnt/shared/design/product_spec.md\n✅ 验收标准：严格遵循 requirements.md 中定义的用户体验 > 性能 > 代码整洁度优先级，以及其中明确列出的验收条款。\n\n注意：请勿修改 /mnt/shared/needs/ 下任何文件；所有设计工作仅限 /mnt/shared/design/ 目录。",
-    "timestamp": "2026-04-14T08:36:01.373141+00:00",
-    "status": "done",
-    "processing_since": "2026-04-14T08:36:08.042294+00:00"
-  }
-]
+[]

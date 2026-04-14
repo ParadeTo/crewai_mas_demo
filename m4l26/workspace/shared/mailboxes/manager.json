@@ -1,13 +1,1 @@
-[
-  {
-    "id": "a41a0cc0-8856-4d29-ad01-2a91fa837ded",
-    "from": "pm",
-    "to": "manager",
-    "type": "task_done",
-    "subject": "产品文档已完成",
-    "content": "产品文档已完成，路径：/mnt/shared/design/product_spec.md，请验收",
-    "timestamp": "2026-04-14T08:36:44.997948+00:00",
-    "status": "done",
-    "processing_since": "2026-04-14T08:37:05.022809+00:00"
-  }
-]
+[]
