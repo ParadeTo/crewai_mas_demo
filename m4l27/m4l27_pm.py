@@ -22,9 +22,13 @@ from crewai.project import CrewBase, agent, crew, task
 # ── 路径设置 ──────────────────────────────────────────────────────────────────
 _M4L27_DIR    = Path(__file__).resolve().parent
 _PROJECT_ROOT = _M4L27_DIR.parent
-for _p in [str(_PROJECT_ROOT), str(_M4L27_DIR)]:
+for _p in [str(_M4L27_DIR), str(_PROJECT_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# 确保 _M4L27_DIR 始终排在 _PROJECT_ROOT 前面（优先解析 m4l27/tools/）
+if sys.path.index(str(_M4L27_DIR)) > sys.path.index(str(_PROJECT_ROOT)):
+    sys.path.remove(str(_M4L27_DIR))
+    sys.path.insert(0, str(_M4L27_DIR))
 
 from llm import aliyun_llm                           # noqa: E402
 from tools.skill_loader_tool import SkillLoaderTool  # noqa: E402
@@ -109,17 +113,24 @@ class PMExecuteCrew(_SessionMixin):
             description     = "{user_request}",
             expected_output = (
                 "完成以下四步：\n"
-                "1. 通过 mailbox-ops skill 读取 PM 邮箱（read_inbox），获取 Manager 的任务分配邮件\n"
-                "2. 读取 /mnt/shared/needs/requirements.md 理解功能需求和验收标准\n"
-                "3. 根据需求撰写产品规格文档，调用 memory-save skill 写入 /mnt/shared/design/product_spec.md\n"
-                "   文档必须包含：产品概述 + 用户故事 + 功能规格（F-01/F-02/...）+ 验收标准\n"
-                "   task_context 要求：明确指定写入路径 /mnt/shared/design/product_spec.md，"
-                "   写入方式用 sandbox_file_operations(action=write)，必须含完整文档内容\n"
-                "4. 通过 mailbox-ops skill 向 Manager 发送完成通知（只发给 manager，不发给其他人）：\n"
+                "1. 调用 skill_loader 工具（skill_name='mailbox-ops'），在 task_context 中说明：\n"
+                "   读取 PM 邮箱（read_inbox），获取 Manager 的任务分配邮件（type: task_assign）\n"
+                "2. 调用 skill_loader 工具（skill_name='memory-save'），在 task_context 中说明：\n"
+                "   读取 /mnt/shared/needs/requirements.md 理解功能需求和验收标准\n"
+                "3. 根据需求撰写产品规格文档，调用 skill_loader 工具（skill_name='memory-save'），\n"
+                "   在 task_context 中说明：\n"
+                "   - 将产品规格文档写入 /mnt/shared/design/product_spec.md\n"
+                "   - 写入方式：sandbox_file_operations(action=write)\n"
+                "   - 文档必须包含：产品概述 + 用户故事 + 功能规格（F-01/F-02/...）+ 验收标准\n"
+                "   - task_context 中必须含完整文档内容\n"
+                "4. 调用 skill_loader 工具（skill_name='mailbox-ops'），在 task_context 中说明：\n"
+                "   向 Manager 发送完成通知（只发给 manager，不发给其他人）：\n"
                 "   - to: manager\n"
-                "   - type: task_done\n"
+                "   - from_: pm\n"
+                "   - type_: task_done\n"
                 "   - subject: 产品文档已完成\n"
                 "   - content: 完成说明（包含文档路径引用，不要复制文档全文）\n"
+                "   注意：skill_loader 是唯一可用工具，不要尝试直接调用 mailbox-ops 或 memory-save 作为 Action\n"
                 "确认邮件发送成功后输出：「产品文档已完成，已通知 Manager 验收」"
             ),
             agent = self.pm_agent(),

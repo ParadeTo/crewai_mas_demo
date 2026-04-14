@@ -2,9 +2,10 @@
 课程：27｜Human as 甲方
 示例文件：m4l27_run.py
 
-演示：4步任务链 + 2个人工确认节点
-  步骤1（Manager）：需求澄清 → 写 requirements.md
+演示：4步任务链 + 2个人工确认节点（步骤1支持多轮需求澄清）
+  步骤1（Manager）：需求澄清 → 写 requirements.md（最多 MAX_CLARIFICATION_ROUNDS 轮）
   [人工确认节点1] run.py 以 manager 身份写 human.json:needs_confirm → 等待用户确认
+                  用户可输入补充意见触发下一轮修订，直到满意为止
   步骤2（Manager）：读SOP → 向 PM 发送 task_assign
   步骤3（PM）：读邮件 → 写产品文档 → 发 manager.json:task_done
   [人工确认节点2] run.py 以 manager 身份写 human.json:checkpoint_request → 等待用户确认
@@ -14,23 +15,34 @@
   - 单一接口原则：human.json 只由 run.py（以 manager 身份）写入，LLM Agent 不直接接触
   - 人工确认节点：run.py 控制时机，不由 LLM 决定何时打扰人
   - wait_for_human()：用 FileLock 读 human.json，模拟异步人机交互
+  - 多轮澄清：编排器控制循环，LLM 无状态，Session hook 负责历史恢复
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from filelock import FileLock
+
+# 需求澄清最大轮次，可通过环境变量覆盖
+MAX_CLARIFICATION_ROUNDS = int(os.getenv("MAX_CLARIFICATION_ROUNDS", "3"))
 
 # ── 路径设置 ──────────────────────────────────────────────────────────────────
 _M4L27_DIR    = Path(__file__).resolve().parent
 _PROJECT_ROOT = _M4L27_DIR.parent
-for _p in [str(_PROJECT_ROOT), str(_M4L27_DIR)]:
+for _p in [str(_M4L27_DIR), str(_PROJECT_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# 确保 _M4L27_DIR 始终排在 _PROJECT_ROOT 前面（优先解析 m4l27/tools/）
+if sys.path.index(str(_M4L27_DIR)) > sys.path.index(str(_PROJECT_ROOT)):
+    sys.path.remove(str(_M4L27_DIR))
+    sys.path.insert(0, str(_M4L27_DIR))
 
 from crewai.hooks import clear_before_llm_call_hooks  # noqa: E402
 from tools.mailbox_ops import send_mail                # noqa: E402
@@ -41,6 +53,27 @@ DESIGN_DIR    = SHARED_DIR / "design"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 人工确认返回值
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class HumanDecision:
+    """
+    wait_for_human() 的返回值，封装用户决策结果。
+
+    confirmed: True 表示用户确认（y），False 表示拒绝（n）
+    feedback:  拒绝时收集的补充意见（allow_feedback=True 时才有值）
+
+    实现了 __bool__，允许 `if decision:` 的简洁写法（等价于 `if decision.confirmed:`）。
+    """
+    confirmed: bool
+    feedback: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.confirmed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 人工确认核心函数
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -48,23 +81,29 @@ def wait_for_human(
     human_inbox: Path,
     expected_type: str,
     step_label: str,
-) -> bool:
+    allow_feedback: bool = False,
+) -> HumanDecision:
     """
     等待人类确认 human.json 中的特定类型消息。
 
     1. 用 FileLock 读取 human.json，找到未读的 expected_type 消息
     2. 打印消息 subject + content
     3. input("你的决定 (y/n)：")
-    4. y → FileLock 内标记该消息 read=True，返回 True
-    5. 其他 → 打印实际内容（debug），返回 False
+    4. y → 标记该消息 read=True，返回 HumanDecision(confirmed=True)
+    5. n → 标记该消息 read=True + rejected=True；
+           若 allow_feedback=True，追加收集补充意见
+           返回 HumanDecision(confirmed=False, feedback=...)
+
+    注意：y/n 都会标记消息 read=True，防止多轮场景下旧消息被重复命中。
 
     Args:
-        human_inbox:   human.json 的完整路径
-        expected_type: 期望的消息类型（"needs_confirm" | "checkpoint_request"）
-        step_label:    打印标签，如"需求确认"
+        human_inbox:    human.json 的完整路径
+        expected_type:  期望的消息类型（"needs_confirm" | "checkpoint_request"）
+        step_label:     打印标签，如"需求确认"
+        allow_feedback: 是否在用户拒绝时收集补充意见（步骤1多轮澄清时传 True）
 
     Returns:
-        True 表示用户确认，False 表示拒绝或消息不存在
+        HumanDecision，confirmed=True 表示用户确认，False 表示拒绝
     """
     lock_path = human_inbox.with_suffix(".lock")
 
@@ -82,7 +121,7 @@ def wait_for_human(
     if target is None:
         print(f"\n[debug] ⚠️  human.json 中未找到未读的 '{expected_type}' 消息")
         print(f"[debug] 实际内容：{json.dumps(messages, ensure_ascii=False, indent=2)}")
-        return False
+        return HumanDecision(confirmed=False)
 
     # ── 步骤2：打印消息，等待用户输入（锁已释放）────────────────────────────
     print(f"\n{'='*60}")
@@ -93,25 +132,77 @@ def wait_for_human(
     print(f"{'='*60}")
 
     decision = input("  你的决定 (y/n)：").strip().lower()
+    confirmed = decision == "y"
 
-    # ── 步骤3：加锁写回已读状态（与读取分开，input()期间不持锁）─────────────
-    if decision == "y":
-        with FileLock(str(lock_path)):
-            # 重新读取以获取最新状态（TOCTOU 窗口可接受，单进程 demo）
-            messages = json.loads(human_inbox.read_text(encoding="utf-8"))
-            for m in messages:
-                if m.get("id") == target["id"]:
-                    m["read"] = True
-                    break
-            human_inbox.write_text(
-                json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+    # ── 步骤3：收集补充意见（仅 allow_feedback=True 且用户拒绝时）──────────
+    feedback: Optional[str] = None
+    if not confirmed and allow_feedback:
+        print("  请输入你的补充意见（直接回车跳过）：")
+        raw_feedback = input("  补充意见：").strip()
+        feedback = raw_feedback if raw_feedback else None
+
+    # ── 步骤4：加锁写回已读状态（y/n 都标记，防止多轮命中旧消息）────────────
+    with FileLock(str(lock_path)):
+        # 重新读取以获取最新状态（TOCTOU 窗口可接受，单进程 demo）
+        messages = json.loads(human_inbox.read_text(encoding="utf-8"))
+        for m in messages:
+            if m.get("id") == target["id"]:
+                m["read"] = True
+                if not confirmed:
+                    m["rejected"] = True          # 审计用，不参与流程路由
+                if feedback:
+                    m["human_feedback"] = feedback  # 审计用
+                break
+        human_inbox.write_text(
+            json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    if confirmed:
         print(f"  ✅ 已确认：{step_label}\n")
-        return True
     else:
-        print(f"  ❌ 已拒绝：{step_label}，演示终止\n")
-        print("  提示：在真实系统中，拒绝会重新触发对应阶段；本 demo 直接退出。\n")
-        return False
+        print(f"  ↩️  已拒绝：{step_label}\n")
+
+    return HumanDecision(confirmed=confirmed, feedback=feedback)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 多轮澄清辅助函数
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_clarification_inputs(
+    initial_request: str,
+    feedback_history: list[str],
+    round_num: int,
+) -> dict:
+    """
+    构造 RequirementsDiscoveryCrew.kickoff() 的 inputs 字典。
+
+    - 第1轮：只传 user_request，revision_context 为空，行为与改动前完全一致
+    - 后续轮：revision_context 包含轮次信息 + 所有历史反馈，引导 LLM 针对性修订
+    - 花括号转义：防止用户反馈中含 { / } 时 CrewAI format_map 报错
+
+    Args:
+        initial_request:  用户的原始需求描述
+        feedback_history: 历轮拒绝时收集的反馈列表（首轮为空）
+        round_num:        当前轮次（从1开始）
+
+    Returns:
+        可直接传入 crew.kickoff(inputs=...) 的字典
+    """
+    if round_num == 1 or not feedback_history:
+        return {"user_request": initial_request, "revision_context": ""}
+
+    # 对用户反馈转义花括号，防止 CrewAI 的 str.format_map() 出错
+    safe_feedbacks = [fb.replace("{", "{{").replace("}", "}}") for fb in feedback_history]
+    feedback_text = "\n".join(
+        f"  第{i+1}轮反馈：{fb}" for i, fb in enumerate(safe_feedbacks)
+    )
+    revision_context = (
+        f"这是第 {round_num} 轮需求文档修订。\n"
+        f"用户对上一版本不满意，反馈如下：\n{feedback_text}\n\n"
+        f"请基于以上反馈修订需求文档，重点修改用户指出的问题，未被质疑的部分保持不变。"
+    )
+    return {"user_request": initial_request, "revision_context": revision_context}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,37 +268,66 @@ def run_demo(initial_request: str = "") -> None:
     print(f"  M4L27 Human as 甲方演示  |  session: {session_id[:8]}...")
     print(f"{'='*60}\n")
 
-    # ── 步骤1：Manager 需求澄清 ────────────────────────────────────────────
-    print("【步骤1】Manager 需求澄清中...（RequirementsDiscoveryCrew）\n")
-    clear_before_llm_call_hooks()          # 清除上轮残留的全局 hook，防止重复触发
-    req_crew = RequirementsDiscoveryCrew(session_id=session_id)
-    result1 = req_crew.crew().kickoff(inputs={"user_request": initial_request})
-    manager_save(req_crew, session_id)
-    result1_text = getattr(result1, "raw", str(result1))
-    print(f"\n步骤1 输出：{result1_text[:200]}...\n")
+    # ── 步骤1：Manager 多轮需求澄清 ──────────────────────────────────────
+    # 控制权在编排器：循环由 run_demo() 驱动，LLM 每轮无状态执行单轮任务
+    # Session 复用：相同 session_id 传给每轮，@before_llm_call hook 自动恢复历史
+    feedback_history: list[str] = []
 
-    if not check_requirements_exists():
-        print("⚠️  步骤1未完成：requirements.md 未生成，终止运行")
-        return
+    for round_num in range(1, MAX_CLARIFICATION_ROUNDS + 1):
+        print(f"【步骤1】需求澄清 第{round_num}/{MAX_CLARIFICATION_ROUNDS}轮...（RequirementsDiscoveryCrew）\n")
+        # ⚠️ clear 必须在 RequirementsDiscoveryCrew().__init__ 之前，
+        #    hook 注册发生在 crew() 内部，顺序：clear → init → crew()
+        clear_before_llm_call_hooks()
 
-    # ── 人工确认节点1：需求文档确认 ───────────────────────────────────────
-    # run.py（编排者）以 manager 身份写 human.json，而非 LLM Agent 直接写
-    send_mail(
-        MAILBOXES_DIR,
-        to="human",
-        from_="manager",
-        type_="needs_confirm",
-        subject="需求文档已整理完毕，请确认",
-        content="需求文档路径：shared/needs/requirements.md（已整理完毕，请打开确认后继续）",
-    )
+        inputs = _build_clarification_inputs(
+            initial_request=initial_request,
+            feedback_history=feedback_history,
+            round_num=round_num,
+        )
 
-    confirmed1 = wait_for_human(
-        MAILBOXES_DIR / "human.json",
-        expected_type="needs_confirm",
-        step_label="需求文档确认",
-    )
-    if not confirmed1:
-        return
+        req_crew = RequirementsDiscoveryCrew(session_id=session_id)
+        result1 = req_crew.crew().kickoff(inputs=inputs)
+        manager_save(req_crew, session_id)
+        result1_text = getattr(result1, "raw", str(result1))
+        print(f"\n步骤1 输出（第{round_num}轮）：{result1_text[:200]}...\n")
+
+        if not check_requirements_exists():
+            print("⚠️  步骤1未完成：requirements.md 未生成，终止运行")
+            return
+
+        # run.py（编排者）以 manager 身份写 human.json，而非 LLM Agent 直接写
+        send_mail(
+            MAILBOXES_DIR,
+            to="human",
+            from_="manager",
+            type_="needs_confirm",
+            subject=f"需求文档（第{round_num}轮）待确认",
+            content=(
+                f"需求文档路径：shared/needs/requirements.md\n"
+                f"当前轮次：{round_num}/{MAX_CLARIFICATION_ROUNDS}"
+            ),
+        )
+
+        decision1 = wait_for_human(
+            MAILBOXES_DIR / "human.json",
+            expected_type="needs_confirm",
+            step_label=f"需求文档确认（第{round_num}轮）",
+            allow_feedback=True,   # 开启反馈收集，支持多轮修订
+        )
+
+        if decision1.confirmed:
+            print(f"✅ 用户已确认需求文档（共 {round_num} 轮）\n")
+            break
+
+        # 用户拒绝：收集反馈准备下一轮
+        fb = decision1.feedback or "用户对文档不满意，请重新审视所有待确认项"
+        feedback_history.append(fb)
+        print(f"  📝 已记录反馈，准备第 {round_num + 1} 轮修订...\n")
+
+        if round_num == MAX_CLARIFICATION_ROUNDS:
+            print(f"⚠️  已达最大轮次（{MAX_CLARIFICATION_ROUNDS}），用户仍未确认，终止运行")
+            print("  提示：可通过 MAX_CLARIFICATION_ROUNDS 环境变量增加最大轮次")
+            return
 
     # ── 步骤2：Manager 分配任务 ────────────────────────────────────────────
     print("【步骤2】Manager 按SOP分配任务给PM...（ManagerAssignCrew）\n")
@@ -258,7 +378,7 @@ def run_demo(initial_request: str = "") -> None:
         expected_type="checkpoint_request",
         step_label="设计文档 Checkpoint",
     )
-    if not confirmed2:
+    if not confirmed2.confirmed:
         return
 
     # ── 步骤4：Manager 验收 ────────────────────────────────────────────────

@@ -44,6 +44,12 @@ skills:
     type: reference   # Dev 技术设计 SOP，只读，不启动沙盒
     enabled: true
 
+  # m4l27：Human as 甲方 Skills
+  - name: requirements-discovery
+    path: ./requirements-discovery
+    type: reference   # 四维需求发现框架，直接注入 Manager Agent 上下文，不启动沙盒
+    enabled: true
+
   # m4l26：任务链与信息传递 Skills
   - name: workspace-rules
     path: ./workspace-rules

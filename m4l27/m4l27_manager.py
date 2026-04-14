@@ -30,9 +30,13 @@ from crewai.project import CrewBase, agent, crew, task
 # ── 路径设置 ──────────────────────────────────────────────────────────────────
 _M4L27_DIR    = Path(__file__).resolve().parent
 _PROJECT_ROOT = _M4L27_DIR.parent
-for _p in [str(_PROJECT_ROOT), str(_M4L27_DIR)]:
+for _p in [str(_M4L27_DIR), str(_PROJECT_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# 确保 _M4L27_DIR 始终排在 _PROJECT_ROOT 前面（优先解析 m4l27/tools/）
+if sys.path.index(str(_M4L27_DIR)) > sys.path.index(str(_PROJECT_ROOT)):
+    sys.path.remove(str(_M4L27_DIR))
+    sys.path.insert(0, str(_M4L27_DIR))
 
 from llm import aliyun_llm                           # noqa: E402
 from tools.skill_loader_tool import SkillLoaderTool  # noqa: E402
@@ -154,19 +158,31 @@ class RequirementsDiscoveryCrew(_SessionMixin):
     @task
     def discover_requirements_task(self) -> Task:
         return Task(
-            description     = "{user_request}",
+            description     = (
+                "{user_request}\n\n"
+                "{revision_context}"
+                # 首轮：revision_context 为空字符串，LLM 只看到原始需求
+                # 后续轮：revision_context 包含用户反馈，LLM 基于反馈修订上一版文档
+                # （上一轮的完整推导过程由 Session hook 自动恢复到 context 中）
+            ),
             expected_output = (
-                "完成以下三步：\n"
+                "完成以下步骤：\n"
                 "1. 阅读用户的初步需求\n"
-                "2. 使用 requirements-discovery skill，按四维框架（目标/边界/约束/风险）"
-                "   梳理出完整需求要点（如需澄清但无法实时追问，记录为「待确认」）\n"
-                "3. 用 memory-save 将整理后的需求文档写入 /mnt/shared/needs/requirements.md\n"
-                "   文档格式：\n"
-                "   ## 目标\n"
-                "   ## 边界（本次做什么 / 不做什么）\n"
-                "   ## 约束\n"
-                "   ## 风险与待确认项\n"
-                "   ## 验收标准\n"
+                "2. 若 revision_context 不为空，优先针对用户反馈修改上一版文档；\n"
+                "   否则调用 skill_loader 工具（skill_name='requirements-discovery'，task_context 留空）\n"
+                "   获取四维框架（目标/边界/约束/风险）指南，按框架全新梳理需求\n"
+                "   （如需澄清但无法实时追问，记录为「待确认」）\n"
+                "3. 调用 skill_loader 工具（skill_name='memory-save'），在 task_context 中说明：\n"
+                "   - 将整理后的需求文档写入路径：/mnt/shared/needs/requirements.md\n"
+                "   - 写入方式：sandbox_file_operations(action=write)\n"
+                "   - 文档必须包含以下章节：\n"
+                "     ## 目标\n"
+                "     ## 边界（本次做什么 / 不做什么）\n"
+                "     ## 约束\n"
+                "     ## 风险与待确认项\n"
+                "     ## 验收标准\n"
+                "   - task_context 中必须包含完整的文档内容\n"
+                "   注意：skill_loader 是唯一可用工具，不要尝试直接调用 memory-save 或 requirements-discovery 作为 Action\n"
                 "确认文档写入后输出：「需求文档已完成，路径：/mnt/shared/needs/requirements.md」"
             ),
             agent = self.manager_agent(),
@@ -217,14 +233,35 @@ class ManagerAssignCrew(_SessionMixin):
         return Task(
             description     = "{user_request}",
             expected_output = (
-                "完成以下步骤：\n"
-                "1. 读取 /mnt/shared/sop/product_design_sop.md，了解产品设计 SOP\n"
-                "2. 读取 /mnt/shared/needs/requirements.md，确认需求已完整\n"
-                "3. 调用 mailbox-ops skill 向 PM 发送任务分配邮件：\n"
-                "   - type: task_assign\n"
-                "   - subject: 产品文档设计任务\n"
-                "   - content: 任务说明（含需求文档路径、验收标准）\n"
-                "输出：「任务已分配给 PM」"
+                "必须严格按以下步骤完成，不得跳过任何一步：\n"
+                "1. 【读SOP】调用 skill_loader 工具，参数：skill_name='memory-save'，\n"
+                "   task_context 中包含：\n"
+                "   {\n"
+                "     \"path\": \"/mnt/shared/sop/product_design_sop.md\",\n"
+                "     \"action\": \"read\"\n"
+                "   }\n"
+                "   等待 SOP 读取结果\n"
+                "2. 【读需求】调用 skill_loader 工具，参数：skill_name='memory-save'，\n"
+                "   task_context 中包含：\n"
+                "   {\n"
+                "     \"path\": \"/mnt/shared/needs/requirements.md\",\n"
+                "     \"action\": \"read\"\n"
+                "   }\n"
+                "   等待需求文档读取结果\n"
+                "3. 【发邮件】调用 skill_loader 工具，参数：skill_name='mailbox-ops'，\n"
+                "   task_context 必须包含完整的发邮件指令：\n"
+                "   {\n"
+                "     \"action\": \"send_mail\",\n"
+                "     \"to\": \"pm\",\n"
+                "     \"from_\": \"manager\",\n"
+                "     \"type_\": \"task_assign\",\n"
+                "     \"subject\": \"产品文档设计任务\",\n"
+                "     \"content\": \"请根据需求文档（/mnt/shared/needs/requirements.md）按照产品设计SOP撰写产品规格文档，写入/mnt/shared/design/product_spec.md，完成后发邮件通知我验收\",\n"
+                "     \"expected_output\": {\"errcode\": 0, \"errmsg\": \"success\", \"msg_id\": \"任意UUID\"}\n"
+                "   }\n"
+                "   ⚠️ 注意：第3步必须在第1、2步之后执行，且 skill_name 必须是 'mailbox-ops'\n"
+                "   skill_loader 是唯一可用工具，不要尝试直接调用 mailbox-ops 作为 Action\n"
+                "输出：「任务已分配给 PM，mailbox-ops 返回 errcode=0」"
             ),
             agent = self.manager_agent(),
         )
@@ -275,12 +312,16 @@ class ManagerReviewCrew(_SessionMixin):
             description     = "{user_request}",
             expected_output = (
                 "完成以下三步：\n"
-                "1. 通过 mailbox-ops skill 读取 Manager 邮箱（read_inbox），获取 PM 的完成通知\n"
-                "2. 读取邮件中引用的产品文档路径（/mnt/shared/design/product_spec.md）\n"
-                "3. 根据需求的验收标准逐项检查，调用 memory-save skill 保存验收结论至 /workspace/review_result.md\n"
-                "   格式：验收结论（通过/需返工）+ 检查项逐条说明\n"
-                "   task_context 要求：明确指定写入路径 /workspace/review_result.md，"
-                "   写入方式用 sandbox_file_operations(action=write)，必须含完整验收内容\n"
+                "1. 调用 skill_loader 工具（skill_name='mailbox-ops'），在 task_context 中说明：\n"
+                "   读取 Manager 邮箱（read_inbox），获取 PM 的完成通知（type: task_done）\n"
+                "2. 调用 skill_loader 工具（skill_name='memory-save'），在 task_context 中说明：\n"
+                "   读取产品文档 /mnt/shared/design/product_spec.md\n"
+                "3. 根据需求的验收标准逐项检查，调用 skill_loader 工具（skill_name='memory-save'），\n"
+                "   在 task_context 中说明：\n"
+                "   - 将验收结论保存至 /workspace/review_result.md\n"
+                "   - 写入方式：sandbox_file_operations(action=write)\n"
+                "   - 格式：验收结论（通过/需返工）+ 检查项逐条说明\n"
+                "   注意：skill_loader 是唯一可用工具，不要尝试直接调用 mailbox-ops 或 memory-save 作为 Action\n"
                 "输出验收结论摘要"
             ),
             agent = self.manager_agent(),

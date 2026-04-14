@@ -1,32 +1,12 @@
 [
   {
-    "id": "fb6525c8-5f29-4e1e-a409-613623f7d6db",
+    "id": "d670f2d1-be03-4ed1-be39-5f06bb1c1aa6",
     "from": "pm",
     "to": "manager",
     "type": "task_done",
     "subject": "产品文档已完成",
-    "content": "产品规格文档已按照要求编写完毕，请查阅 /mnt/shared/output/product_spec.md 文件进行验收。",
-    "timestamp": "2026-04-10T13:38:03.442047+00:00",
-    "read": true
-  },
-  {
-    "id": "8d02b027-c62a-4a41-83d1-b79831465b8f",
-    "from": "pm",
-    "to": "manager",
-    "type": "task_done",
-    "subject": "产品文档已完成",
-    "content": "产品规格文档已经完成，您可以查看 /mnt/shared/design/product_spec.md 路径下的文档进行验收。",
-    "timestamp": "2026-04-10T13:44:08.710726+00:00",
-    "read": true
-  },
-  {
-    "id": "4e9b2cab-f88b-4c91-9559-e16be09b7018",
-    "from": "pm",
-    "to": "manager",
-    "type": "task_done",
-    "subject": "产品文档已完成",
-    "content": "尊敬的Manager，\n\n根据您的要求，我已完成了产品规格文档的设计，并将其保存在 /mnt/shared/design/product_spec.md。请您查阅并验收。\n\n此致,\nPM",
-    "timestamp": "2026-04-10T15:12:46.743435+00:00",
+    "content": "经理您好，\n\n根据您的要求，我已完成了产品规格文档的撰写。文档已存放在 /mnt/shared/design/product_spec.md，请您查阅。\n\n如有任何问题或需要进一步讨论的地方，请随时与我联系。\n\n谢谢！\nPM",
+    "timestamp": "2026-04-14T16:19:04.792068+00:00",
     "read": true
   }
 ]

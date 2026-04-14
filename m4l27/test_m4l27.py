@@ -3,16 +3,21 @@
 test_m4l27.py — 单元测试 + 集成测试
 
 单元测试（无需LLM，每次 CI 必跑）：
-  T_unit_1_no_message_blocks     human.json 为空时 check 返回 False
-  T_unit_2_pm_cannot_write_human PM 尝试直接写 human.json → raise ValueError
-  T_unit_3_manager_can_write_human Manager 写 human.json → 消息写入成功
-  T_unit_4_wait_marks_read       wait_for_human 找到消息后标记 read=True
+  T_unit_1_no_message_blocks          human.json 为空时 check 返回 False
+  T_unit_2_pm_cannot_write_human      PM 尝试直接写 human.json → raise ValueError
+  T_unit_3_manager_can_write_human    Manager 写 human.json → 消息写入成功
+  T_unit_4_wait_marks_read            wait_for_human 用户确认后标记 read=True
+  T_unit_5_wait_rejects_also_marks    wait_for_human 用户拒绝后也标记 read=True（多轮修复）
+  T_unit_6_wait_feedback_collected    allow_feedback=True 时用户拒绝并输入反馈
+  T_unit_7_build_inputs_round1        _build_clarification_inputs 首轮不含 revision_context
+  T_unit_8_build_inputs_round2        _build_clarification_inputs 后续轮含历史反馈
+  T_unit_9_build_inputs_escape        反馈中含 {} 时自动转义
 
 集成测试（需要 LLM，标记 @needs_llm）：
-  T_int_1_requirements_generated RequirementsDiscoveryCrew 运行后 requirements.md 存在
-  T_int_2_task_assign_sent       ManagerAssignCrew 运行后 pm.json 有 task_assign
-  T_int_3_product_spec_exists    PMExecuteCrew 运行后 product_spec.md 存在
-  T_int_4_review_result_exists   ManagerReviewCrew 运行后 review_result.md 存在
+  T_int_1_requirements_generated  RequirementsDiscoveryCrew 运行后 requirements.md 存在
+  T_int_2_task_assign_sent        ManagerAssignCrew 运行后 pm.json 有 task_assign
+  T_int_3_product_spec_exists     PMExecuteCrew 运行后 product_spec.md 存在
+  T_int_4_review_result_exists    ManagerReviewCrew 运行后 review_result.md 存在
 """
 
 from __future__ import annotations
@@ -127,12 +132,12 @@ class TestSinglePointOfContact:
 
 
 class TestWaitForHuman:
-    """T_unit_4: wait_for_human 正确标记消息已读"""
+    """T_unit_4~6: wait_for_human 行为验证"""
 
     def test_wait_marks_message_read_on_confirm(self, tmp_mailboxes: Path) -> None:
-        from m4l27_run import wait_for_human  # 延迟导入，实现后生效
+        """T_unit_4: 用户确认(y)后消息标记 read=True，返回 confirmed=True"""
+        from m4l27_run import wait_for_human
 
-        # 先发一条 needs_confirm 消息
         send_mail(
             tmp_mailboxes,
             to="human",
@@ -144,15 +149,16 @@ class TestWaitForHuman:
 
         human_inbox = tmp_mailboxes / "human.json"
 
-        # 模拟用户输入 y
         with patch("builtins.input", return_value="y"):
             result = wait_for_human(human_inbox, expected_type="needs_confirm", step_label="需求确认")
 
-        assert result is True
+        assert result.confirmed is True
         messages = json.loads(human_inbox.read_text(encoding="utf-8"))
         assert messages[0]["read"] is True, "用户确认后消息应标记为已读"
+        assert "rejected" not in messages[0], "确认时不应有 rejected 字段"
 
-    def test_wait_returns_false_on_reject(self, tmp_mailboxes: Path) -> None:
+    def test_wait_rejects_also_marks_read(self, tmp_mailboxes: Path) -> None:
+        """T_unit_5: 用户拒绝(n)后消息也标记 read=True + rejected=True，防止多轮命中旧消息"""
         from m4l27_run import wait_for_human
 
         send_mail(
@@ -169,19 +175,91 @@ class TestWaitForHuman:
         with patch("builtins.input", return_value="n"):
             result = wait_for_human(human_inbox, expected_type="needs_confirm", step_label="需求确认")
 
-        assert result is False
+        assert result.confirmed is False
         messages = json.loads(human_inbox.read_text(encoding="utf-8"))
-        assert messages[0]["read"] is False, "用户拒绝后消息不应标记已读"
+        assert messages[0]["read"] is True, "用户拒绝后消息也应标记为已读（防多轮重复命中）"
+        assert messages[0].get("rejected") is True, "拒绝时应有 rejected=True 字段"
+
+    def test_wait_feedback_collected(self, tmp_mailboxes: Path) -> None:
+        """T_unit_6: allow_feedback=True 时拒绝并输入反馈，反馈写入 human.json 且返回 feedback 字段"""
+        from m4l27_run import wait_for_human
+
+        send_mail(
+            tmp_mailboxes,
+            to="human",
+            from_="manager",
+            type_="needs_confirm",
+            subject="请确认需求文档",
+            content="shared/needs/requirements.md",
+        )
+
+        human_inbox = tmp_mailboxes / "human.json"
+
+        # 第1次 input()：决定 (n)；第2次 input()：补充意见
+        with patch("builtins.input", side_effect=["n", "希望增加性能指标"]):
+            result = wait_for_human(
+                human_inbox,
+                expected_type="needs_confirm",
+                step_label="需求确认",
+                allow_feedback=True,
+            )
+
+        assert result.confirmed is False
+        assert result.feedback == "希望增加性能指标"
+        messages = json.loads(human_inbox.read_text(encoding="utf-8"))
+        assert messages[0].get("human_feedback") == "希望增加性能指标", "反馈应写入消息记录"
 
     def test_wait_returns_false_when_no_message(self, tmp_mailboxes: Path) -> None:
+        """无消息时返回 confirmed=False"""
         from m4l27_run import wait_for_human
 
         human_inbox = tmp_mailboxes / "human.json"
-        # 不发任何消息
         with patch("builtins.input", return_value="y"):
             result = wait_for_human(human_inbox, expected_type="needs_confirm", step_label="需求确认")
 
-        assert result is False
+        assert result.confirmed is False
+
+
+class TestBuildClarificationInputs:
+    """T_unit_7~9: _build_clarification_inputs() 输入构造逻辑"""
+
+    def test_round1_no_revision_context(self) -> None:
+        """T_unit_7: 第1轮 revision_context 为空字符串"""
+        from m4l27_run import _build_clarification_inputs
+
+        inputs = _build_clarification_inputs("做一个电商网站", [], 1)
+        assert inputs["user_request"] == "做一个电商网站"
+        assert inputs["revision_context"] == ""
+
+    def test_round2_contains_feedback(self) -> None:
+        """T_unit_8: 第2轮 revision_context 包含历史反馈"""
+        from m4l27_run import _build_clarification_inputs
+
+        inputs = _build_clarification_inputs(
+            "做一个电商网站",
+            ["希望增加性能指标"],
+            2,
+        )
+        assert inputs["user_request"] == "做一个电商网站"
+        assert "第 2 轮" in inputs["revision_context"]
+        assert "第1轮反馈：希望增加性能指标" in inputs["revision_context"]
+
+    def test_curly_braces_escaped(self) -> None:
+        """T_unit_9: 反馈中含 {} 时自动转义，防止 CrewAI format_map 出错"""
+        from m4l27_run import _build_clarification_inputs
+
+        inputs = _build_clarification_inputs(
+            "做一个电商网站",
+            ["需要支持 {json} 格式的 API 响应"],
+            2,
+        )
+        # 转义后 { → {{ ，} → }}，原始 {json} 不应出现在转义结果中（除非已被双写）
+        rc = inputs["revision_context"]
+        # 转义后，{{ 和 }} 中间是 json，不会出现单个 { 或 }
+        assert "{{json}}" in rc, "花括号应被转义为 {{json}}"
+        # 验证没有未转义的单花括号包住 json（转义前的原始形式）
+        import re
+        assert not re.search(r'(?<!\{)\{json\}(?!\})', rc), "不应有未转义的 {json}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,7 +277,8 @@ class TestIntegrationRequirements:
         session_id = str(uuid.uuid4())
         crew = RequirementsDiscoveryCrew(session_id=session_id)
         crew.crew().kickoff(inputs={
-            "user_request": "帮我把用户注册流程的产品设计做出来。注册支持邮箱方式，需要邮件验证，不需要社交登录。"
+            "user_request": "帮我把用户注册流程的产品设计做出来。注册支持邮箱方式，需要邮件验证，不需要社交登录。",
+            "revision_context": "",
         })
         manager_save(crew, session_id)
 
